@@ -1,13 +1,13 @@
 #!/bin/bash
-# MMTracking Environment Setup Script for macOS (Apple Silicon)
-# This script creates a conda environment for running ByteTrack with MMTracking on Mac
+# MMTracking + MMPose Environment Setup Script for macOS (Apple Silicon)
+# This script creates a conda environment for running ByteTrack with MMTracking and MMPose on Mac
 
 set -e
 
 ENV_NAME="mmtrack"
 
 echo "========================================"
-echo "MMTracking Environment Setup for macOS"
+echo "MMTracking + MMPose Setup for macOS"
 echo "========================================"
 
 # Check if environment already exists
@@ -45,18 +45,33 @@ echo "[5/7] Installing MMDetection and MMClassification..."
 pip install mmdet==2.28.0 mmcls==0.25.0
 
 # Install MMTracking and dependencies
-echo "[6/7] Installing MMTracking and dependencies..."
+echo "[6/9] Installing MMTracking and dependencies..."
 pip install scipy pandas seaborn motmetrics lapx attributee dotty-dict tqdm pytz requests
 pip install -e .
 
-# Download checkpoint
-echo "[7/7] Downloading ByteTrack checkpoint..."
+# Install MMPose and dependencies
+echo "[7/9] Installing MMPose dependencies..."
+pip install cython
+pip install xtcocotools --no-build-isolation
+pip install mmpose==0.29.0
+
+# Download ByteTrack checkpoint
+echo "[8/9] Downloading ByteTrack checkpoint..."
 mkdir -p checkpoints
 if [ ! -f "checkpoints/bytetrack_yolox_x_mot17.pth" ]; then
     curl -L -o checkpoints/bytetrack_yolox_x_mot17.pth \
         "https://download.openmmlab.com/mmtracking/mot/bytetrack/bytetrack_yolox_x/bytetrack_yolox_x_crowdhuman_mot17-private-half_20211218_205500-1985c9f0.pth"
 else
     echo "Checkpoint already exists, skipping download."
+fi
+
+# Download HRNet pose checkpoint
+echo "[9/9] Downloading HRNet pose checkpoint..."
+if [ ! -f "checkpoints/hrnet_w48_coco_256x192.pth" ]; then
+    curl -L -o checkpoints/hrnet_w48_coco_256x192.pth \
+        "https://download.openmmlab.com/mmpose/top_down/hrnet/hrnet_w48_coco_256x192-b9e0b3ab_20200708.pth"
+else
+    echo "Pose checkpoint already exists, skipping download."
 fi
 
 echo ""
@@ -75,5 +90,13 @@ echo "    --output outputs/result.mp4 \\"
 echo "    --checkpoint checkpoints/bytetrack_yolox_x_mot17.pth \\"
 echo "    --device cpu \\"
 echo "    --fps 30"
+echo ""
+echo "To run MMPose on an image:"
+echo "  python demo/demo_pose.py \\"
+echo "    --config configs/pose/hrnet_w48_coco_256x192.py \\"
+echo "    --checkpoint checkpoints/hrnet_w48_coco_256x192.pth \\"
+echo "    --img <your_image.jpg> \\"
+echo "    --output outputs/pose_result.jpg \\"
+echo "    --device cpu"
 echo ""
 echo "Note: Use '--device cpu' on Mac (MPS support may vary)."
