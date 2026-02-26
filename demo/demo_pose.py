@@ -4,12 +4,98 @@ import os
 import os.path as osp
 from argparse import ArgumentParser
 
+import numpy as np
 import mmcv
 from mmcv import Config
 
 from mmpose.apis import (inference_top_down_pose_model, init_pose_model,
                          vis_pose_result)
 from mmpose.datasets import DatasetInfo
+
+
+# Target 14-keypoint format indices and names
+KEYPOINT_14_NAMES = [
+    'Nose', 'LShoulder', 'RShoulder', 'LElbow', 'RElbow',
+    'LWrist', 'RWrist', 'LHip', 'RHip', 'LKnee', 'RKnee',
+    'LAnkle', 'RAnkle', 'Neck'
+]
+
+
+def convert_coco17_to_14keypoints(coco_keypoints):
+    """
+    Convert COCO 17-keypoint format to 14-keypoint format.
+    
+    COCO 17 keypoints:
+        0: nose, 1: left_eye, 2: right_eye, 3: left_ear, 4: right_ear,
+        5: left_shoulder, 6: right_shoulder, 7: left_elbow, 8: right_elbow,
+        9: left_wrist, 10: right_wrist, 11: left_hip, 12: right_hip,
+        13: left_knee, 14: right_knee, 15: left_ankle, 16: right_ankle
+    
+    Target 14 keypoints:
+        0: Nose, 1: LShoulder, 2: RShoulder, 3: LElbow, 4: RElbow,
+        5: LWrist, 6: RWrist, 7: LHip, 8: RHip, 9: LKnee, 10: RKnee,
+        11: LAnkle, 12: RAnkle, 13: Neck (computed from shoulders)
+    
+    Args:
+        coco_keypoints: numpy array of shape (17, 3) with [x, y, confidence]
+    
+    Returns:
+        numpy array of shape (14, 3) with [x, y, confidence]
+    """
+    # Mapping from target index to COCO index
+    # Neck (index 13) is computed separately
+    coco_to_14_mapping = {
+        0: 0,   # Nose -> nose
+        1: 5,   # LShoulder -> left_shoulder
+        2: 6,   # RShoulder -> right_shoulder
+        3: 7,   # LElbow -> left_elbow
+        4: 8,   # RElbow -> right_elbow
+        5: 9,   # LWrist -> left_wrist
+        6: 10,  # RWrist -> right_wrist
+        7: 11,  # LHip -> left_hip
+        8: 12,  # RHip -> right_hip
+        9: 13,  # LKnee -> left_knee
+        10: 14, # RKnee -> right_knee
+        11: 15, # LAnkle -> left_ankle
+        12: 16, # RAnkle -> right_ankle
+    }
+    
+    keypoints_14 = np.zeros((14, 3), dtype=np.float32)
+    
+    # Map direct correspondences
+    for target_idx, coco_idx in coco_to_14_mapping.items():
+        keypoints_14[target_idx] = coco_keypoints[coco_idx]
+    
+    # Compute Neck as midpoint of left_shoulder (5) and right_shoulder (6)
+    left_shoulder = coco_keypoints[5]
+    right_shoulder = coco_keypoints[6]
+    
+    neck_x = (left_shoulder[0] + right_shoulder[0]) / 2
+    neck_y = (left_shoulder[1] + right_shoulder[1]) / 2
+    # Confidence is the minimum of the two shoulders
+    neck_conf = min(left_shoulder[2], right_shoulder[2])
+    
+    keypoints_14[13] = [neck_x, neck_y, neck_conf]
+    
+    return keypoints_14
+
+
+def convert_pose_results_to_14keypoints(pose_results):
+    """
+    Convert a list of pose results from COCO 17-keypoint to 14-keypoint format.
+    
+    Args:
+        pose_results: List of dicts, each containing 'keypoints' of shape (17, 3)
+    
+    Returns:
+        List of numpy arrays of shape (14, 3) - one per detected person
+    """
+    track_kpts = []
+    for result in pose_results:
+        coco_kpts = result['keypoints']
+        kpts_14 = convert_coco17_to_14keypoints(coco_kpts)
+        track_kpts.append(kpts_14)
+    return track_kpts
 
 
 def main():
@@ -142,7 +228,7 @@ def main():
     # Print keypoint info
     if pose_results:
         keypoints = pose_results[0]['keypoints']
-        print(f'\nDetected {len(keypoints)} keypoints:')
+        print(f'\nDetected {len(keypoints)} COCO keypoints:')
         kpt_names = ['nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',
                      'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
                      'left_wrist', 'right_wrist', 'left_hip', 'right_hip',
@@ -150,6 +236,16 @@ def main():
         for i, (kpt, name) in enumerate(zip(keypoints, kpt_names)):
             if kpt[2] > args.kpt_thr:
                 print(f'  {name}: ({kpt[0]:.1f}, {kpt[1]:.1f}) conf={kpt[2]:.2f}')
+        
+        # Convert to 14-keypoint format
+        track_kpts = convert_pose_results_to_14keypoints(pose_results)
+        print(f'\n--- Converted to 14-keypoint format ---')
+        print(f'track_kpts: List[{len(track_kpts)}] of (14, 3) arrays')
+        for person_idx, kpts_14 in enumerate(track_kpts):
+            print(f'\nPerson {person_idx}:')
+            for i, (kpt, name) in enumerate(zip(kpts_14, KEYPOINT_14_NAMES)):
+                if kpt[2] > args.kpt_thr:
+                    print(f'  {name}: ({kpt[0]:.1f}, {kpt[1]:.1f}) conf={kpt[2]:.2f}')
 
 
 if __name__ == '__main__':

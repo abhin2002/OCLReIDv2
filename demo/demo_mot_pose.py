@@ -1,11 +1,13 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """
-MMTracking + MMPose Pipeline Demo
-Combines ByteTrack object tracking with HRNet pose estimation.
+MMTracking + MMPose + HOE Pipeline Demo
+Combines ByteTrack object tracking with HRNet pose estimation and
+Human Orientation Estimation (HOE).
 """
 import os
 import os.path as osp
 import tempfile
+import math
 from argparse import ArgumentParser
 
 import cv2
@@ -16,6 +18,9 @@ from mmtrack.apis import inference_mot, init_model as init_track_model
 from mmpose.apis import (inference_top_down_pose_model, init_pose_model,
                          vis_pose_result)
 from mmpose.datasets import DatasetInfo
+
+# Import HOE estimator for orientation estimation
+from mmtrack.models.orientation.hoe_estimator import init_hoe_model
 
 
 # COCO dataset info for pose estimation
@@ -85,8 +90,8 @@ def draw_tracking_results(img, track_bboxes, track_ids, font_scale=0.6, thicknes
         x1, y1, x2, y2 = map(int, bbox[:4])
         color = get_track_id_color(track_id)
         
-        # Draw bounding box
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+        # # Draw bounding box
+        # cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
         
         # Draw track ID label
         label = f'ID:{track_id}'
@@ -142,6 +147,215 @@ def draw_pose_results(img, pose_results, kpt_thr=0.3, radius=4, thickness=2):
     return img
 
 
+def draw_pose_results_14kpt(img, keypoints_14_list, track_ids, kpt_thr=0.3, radius=4, thickness=2):
+    """Draw 14-keypoint pose results on image.
+    
+    14 keypoints: Nose, LShoulder, RShoulder, LElbow, RElbow, LWrist, RWrist,
+                  LHip, RHip, LKnee, RKnee, LAnkle, RAnkle, Neck
+    """
+    # Skeleton for 14-keypoint format (pairs of keypoint indices)
+    skeleton_14 = [
+        [11, 9], [9, 7], [12, 10], [10, 8], [7, 8],  # legs: LAnkle-LKnee, LKnee-LHip, RAnkle-RKnee, RKnee-RHip, LHip-RHip
+        [1, 7], [2, 8], [1, 2],  # torso: LShoulder-LHip, RShoulder-RHip, LShoulder-RShoulder
+        [1, 3], [2, 4], [3, 5], [4, 6],  # arms: LShoulder-LElbow, RShoulder-RElbow, LElbow-LWrist, RElbow-RWrist
+        [0, 13], [13, 1], [13, 2]  # neck connections: Nose-Neck, Neck-LShoulder, Neck-RShoulder
+    ]
+    
+    # Colors for skeleton links
+    pose_link_color = [
+        [0, 255, 0], [0, 255, 0], [255, 128, 0], [255, 128, 0], [51, 153, 255],
+        [51, 153, 255], [51, 153, 255], [51, 153, 255],
+        [0, 255, 0], [255, 128, 0], [0, 255, 0], [255, 128, 0],
+        [51, 153, 255], [51, 153, 255], [51, 153, 255]
+    ]
+    
+    for keypoints, track_id in zip(keypoints_14_list, track_ids):
+        base_color = get_track_id_color(track_id)
+        
+        # Draw keypoints
+        for kid, kpt in enumerate(keypoints):
+            x, y, score = int(kpt[0]), int(kpt[1]), kpt[2]
+            if score > kpt_thr:
+                cv2.circle(img, (x, y), radius, base_color, -1)
+        
+        # Draw skeleton
+        for sk_idx, sk in enumerate(skeleton_14):
+            kpt1_idx, kpt2_idx = sk
+            kpt1 = keypoints[kpt1_idx]
+            kpt2 = keypoints[kpt2_idx]
+            
+            if kpt1[2] > kpt_thr and kpt2[2] > kpt_thr:
+                x1, y1 = int(kpt1[0]), int(kpt1[1])
+                x2, y2 = int(kpt2[0]), int(kpt2[1])
+                link_color = pose_link_color[sk_idx] if sk_idx < len(pose_link_color) else base_color
+                cv2.line(img, (x1, y1), (x2, y2), link_color, thickness)
+    
+    return img
+
+
+def draw_orientation_results(img, bboxes, track_ids, orientations, binary_orientations, 
+                              font_scale=0.5, thickness=2, arrow_length=40):
+    """
+    Draw orientation indicators on the image.
+    
+    Args:
+        img: Input image (BGR)
+        bboxes: Array of [x1, y1, x2, y2, ...] bounding boxes
+        track_ids: List of track IDs
+        orientations: List of orientation angles in degrees (0-355)
+        binary_orientations: List of binary orientation (0=Front, 1=Back)
+        font_scale: Font scale for text
+        thickness: Line thickness
+        arrow_length: Length of orientation arrow
+    
+    Returns:
+        Image with orientation indicators
+    """
+    for i, (bbox, track_id, ori, bin_ori) in enumerate(zip(bboxes, track_ids, 
+                                                            orientations, binary_orientations)):
+        x1, y1, x2, y2 = map(int, bbox[:4])
+        color = get_track_id_color(track_id)
+        
+        # Calculate center of bbox
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        
+        # Draw orientation arrow from center
+        # Convert degrees to radians (0° = facing right, 90° = facing down)
+        angle_rad = math.radians(ori - 90)  # Adjust so 0° points up
+        arrow_end_x = int(cx + arrow_length * math.cos(angle_rad))
+        arrow_end_y = int(cy + arrow_length * math.sin(angle_rad))
+        
+        # Draw arrow
+        cv2.arrowedLine(img, (cx, cy), (arrow_end_x, arrow_end_y), 
+                        color, thickness + 1, tipLength=0.3)
+        
+        # Draw orientation text below or above bbox, ensure it's visible on frame
+        ori_label = f'{int(round(ori))}deg ({"F" if bin_ori == 0 else "B"})'
+        (label_w, label_h), baseline = cv2.getTextSize(ori_label, cv2.FONT_HERSHEY_SIMPLEX,
+                                   font_scale, thickness)
+        pad = 4
+        h, w = img.shape[:2]
+
+        # Try placing below bbox
+        lx1 = x1
+        ly1 = y2 + pad
+        lx2 = lx1 + label_w + 2 * pad
+        ly2 = ly1 + label_h + baseline + 2 * pad
+
+        # If label goes outside bottom, place above bbox
+        if ly2 > h:
+            ly2 = y1 - pad
+            ly1 = ly2 - (label_h + baseline + 2 * pad)
+
+        # Clamp horizontally
+        if lx2 > w:
+            lx2 = w - 1
+            lx1 = max(w - (label_w + 2 * pad), 0)
+        if lx1 < 0:
+            lx1 = 0
+
+        # Clamp vertically
+        if ly1 < 0:
+            ly1 = 0
+        if ly2 > h:
+            ly2 = h - 1
+
+        # Draw background rectangle and text (white text on track color)
+        cv2.rectangle(img, (int(lx1), int(ly1)), (int(lx2), int(ly2)), color, -1)
+        text_org = (int(lx1 + pad), int(ly2 - baseline - pad))
+        cv2.putText(img, ori_label, text_org, cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+    
+    return img
+
+
+
+# Target 14-keypoint format indices and names
+KEYPOINT_14_NAMES = [
+    'Nose', 'LShoulder', 'RShoulder', 'LElbow', 'RElbow',
+    'LWrist', 'RWrist', 'LHip', 'RHip', 'LKnee', 'RKnee',
+    'LAnkle', 'RAnkle', 'Neck'
+]
+
+
+def convert_coco17_to_14keypoints(coco_keypoints):
+    """
+    Convert COCO 17-keypoint format to 14-keypoint format.
+    
+    COCO 17 keypoints:
+        0: nose, 1: left_eye, 2: right_eye, 3: left_ear, 4: right_ear,
+        5: left_shoulder, 6: right_shoulder, 7: left_elbow, 8: right_elbow,
+        9: left_wrist, 10: right_wrist, 11: left_hip, 12: right_hip,
+        13: left_knee, 14: right_knee, 15: left_ankle, 16: right_ankle
+    
+    Target 14 keypoints:
+        0: Nose, 1: LShoulder, 2: RShoulder, 3: LElbow, 4: RElbow,
+        5: LWrist, 6: RWrist, 7: LHip, 8: RHip, 9: LKnee, 10: RKnee,
+        11: LAnkle, 12: RAnkle, 13: Neck (computed from shoulders)
+    
+    Args:
+        coco_keypoints: numpy array of shape (17, 3) with [x, y, confidence]
+    
+    Returns:
+        numpy array of shape (14, 3) with [x, y, confidence]
+    """
+    # Mapping from target index to COCO index
+    # Neck (index 13) is computed separately
+    coco_to_14_mapping = {
+        0: 0,   # Nose -> nose
+        1: 5,   # LShoulder -> left_shoulder
+        2: 6,   # RShoulder -> right_shoulder
+        3: 7,   # LElbow -> left_elbow
+        4: 8,   # RElbow -> right_elbow
+        5: 9,   # LWrist -> left_wrist
+        6: 10,  # RWrist -> right_wrist
+        7: 11,  # LHip -> left_hip
+        8: 12,  # RHip -> right_hip
+        9: 13,  # LKnee -> left_knee
+        10: 14, # RKnee -> right_knee
+        11: 15, # LAnkle -> left_ankle
+        12: 16, # RAnkle -> right_ankle
+    }
+    
+    keypoints_14 = np.zeros((14, 3), dtype=np.float32)
+    
+    # Map direct correspondences
+    for target_idx, coco_idx in coco_to_14_mapping.items():
+        keypoints_14[target_idx] = coco_keypoints[coco_idx]
+    
+    # Compute Neck as midpoint of left_shoulder (5) and right_shoulder (6)
+    left_shoulder = coco_keypoints[5]
+    right_shoulder = coco_keypoints[6]
+    
+    neck_x = (left_shoulder[0] + right_shoulder[0]) / 2
+    neck_y = (left_shoulder[1] + right_shoulder[1]) / 2
+    # Confidence is the minimum of the two shoulders
+    neck_conf = min(left_shoulder[2], right_shoulder[2])
+    
+    keypoints_14[13] = [neck_x, neck_y, neck_conf]
+    
+    return keypoints_14
+
+
+def convert_pose_results_to_14keypoints(pose_results):
+    """
+    Convert a list of pose results from COCO 17-keypoint to 14-keypoint format.
+    
+    Args:
+        pose_results: List of dicts, each containing 'keypoints' of shape (17, 3)
+    
+    Returns:
+        List of numpy arrays of shape (14, 3) - one per detected person
+    """
+    track_kpts = []
+    for result in pose_results:
+        coco_kpts = result['keypoints']
+        kpts_14 = convert_coco17_to_14keypoints(coco_kpts)
+        track_kpts.append(kpts_14)
+    return track_kpts
+
+
 def main():
     parser = ArgumentParser(description='MMTracking + MMPose Pipeline Demo')
     
@@ -157,12 +371,21 @@ def main():
                         default='checkpoints/hrnet_w48_coco_256x192.pth',
                         help='pose checkpoint file')
     
+    # HOE (Orientation Estimation) arguments
+    parser.add_argument('--hoe-checkpoint',
+                        default='mmtrack/models/orientation/checkpoints/keypoints_net.pth',
+                        help='HOE model checkpoint file')
+    parser.add_argument('--enable-hoe', action='store_true', default=True,
+                        help='Enable orientation estimation')
+    parser.add_argument('--no-hoe', action='store_false', dest='enable_hoe',
+                        help='Disable orientation estimation')
+    
     # I/O arguments
     parser.add_argument('--input', required=True, help='input video file')
     parser.add_argument('--output', help='output video file (mp4 format)')
     
     # Detection/tracking thresholds
-    parser.add_argument('--score-thr', type=float, default=0.5,
+    parser.add_argument('--score-thr', type=float, default=0.0,
                         help='bounding box score threshold for tracking')
     parser.add_argument('--kpt-thr', type=float, default=0.3,
                         help='keypoint score threshold for pose')
@@ -171,7 +394,7 @@ def main():
     parser.add_argument('--device', default='cpu', help='device (cpu or cuda:0)')
     
     # Visualization
-    parser.add_argument('--show', action='store_true', help='show results')
+    parser.add_argument('--show', action='store_true', help='show results', default=True)
     parser.add_argument('--fps', type=int, help='output video FPS')
     parser.add_argument('--thickness', type=int, default=2, help='line thickness')
     parser.add_argument('--radius', type=int, default=4, help='keypoint radius')
@@ -186,6 +409,12 @@ def main():
     
     print('Loading pose model...')
     pose_model = init_pose_model(args.pose_config, args.pose_checkpoint, device=args.device)
+    
+    # Load HOE model for orientation estimation
+    hoe_model = None
+    if args.enable_hoe:
+        print('Loading HOE (orientation estimation) model...')
+        hoe_model = init_hoe_model(checkpoint_path=args.hoe_checkpoint, device=args.device)
     
     # Get dataset info for pose
     dataset_info = DatasetInfo(COCO_DATASET_INFO)
@@ -220,24 +449,24 @@ def main():
         track_bboxes = track_result.get('track_bboxes', [])
         
         if len(track_bboxes) > 0 and len(track_bboxes[0]) > 0:
-            # track_bboxes[0] contains [x1, y1, x2, y2, score, track_id]
+            # track_bboxes[0] contains [track_id, x1, y1, x2, y2, score]
             bboxes = track_bboxes[0]
             
-            # Filter by score threshold
-            valid_mask = bboxes[:, 4] >= args.score_thr
+            # Filter by score threshold (score is at index 5)
+            valid_mask = bboxes[:, 5] >= args.score_thr
             bboxes = bboxes[valid_mask]
             
             if len(bboxes) > 0:
-                # Extract track IDs (last column)
-                track_ids = bboxes[:, 5].astype(int)
+                # Extract track IDs (first column)
+                track_ids = bboxes[:, 0].astype(int)
                 
                 # Prepare person results for pose estimation
                 # Format: [{'bbox': [x1, y1, x2, y2, score]}]
                 person_results = []
                 for i, bbox in enumerate(bboxes):
                     person_results.append({
-                        'bbox': bbox[:5],  # x1, y1, x2, y2, score
-                        'track_id': int(bbox[5])
+                        'bbox': np.array([bbox[1], bbox[2], bbox[3], bbox[4], bbox[5]]),  # x1, y1, x2, y2, score
+                        'track_id': int(bbox[0])
                     })
                 
                 # Step 2: Run pose estimation on tracked persons
@@ -257,22 +486,51 @@ def main():
                     if i < len(person_results):
                         pose_result['track_id'] = person_results[i]['track_id']
                 
-                # Step 3: Visualize results
+                # Convert to 14-keypoint format
+                keypoints_14_list = convert_pose_results_to_14keypoints(pose_results)
+                # keypoints_14_list is a list of (14, 3) arrays, one per tracked person
+                # Can be used for downstream tasks like ReID, action recognition, etc.
+                
+                # Step 3: Orientation estimation (HOE)
+                orientations = []
+                binary_orientations = []
+                if hoe_model is not None and len(keypoints_14_list) > 0:
+                    # Get bboxes for normalization (x1, y1, x2, y2 format)
+                    bbox_list = [bbox[1:5] for bbox in bboxes]  # Skip track_id
+                    
+                    # Estimate orientation
+                    orientations, binary_orientations, confidences = hoe_model.estimate_orientation(
+                        keypoints_14_list, bboxes=bbox_list
+                    )
+                    
+                    # Print orientation info for debugging
+                    # for tid, ori, bin_ori in zip(track_ids, orientations, binary_orientations):
+                    #     print(f'  Track {tid}: {ori}° ({"Front" if bin_ori == 0 else "Back"})')
+                
+                # Step 4: Visualize results
                 vis_frame = frame.copy()
                 
-                # Draw tracking boxes with IDs
+                # Draw tracking boxes with IDs (bbox coords are at indices 1-4)
                 vis_frame = draw_tracking_results(
-                    vis_frame, bboxes[:, :4], track_ids,
+                    vis_frame, bboxes[:, 1:5], track_ids,
                     thickness=args.thickness
                 )
                 
-                # Draw pose keypoints
-                vis_frame = draw_pose_results(
-                    vis_frame, pose_results,
+                # Draw 14-keypoint pose results
+                vis_frame = draw_pose_results_14kpt(
+                    vis_frame, keypoints_14_list, track_ids,
                     kpt_thr=args.kpt_thr,
                     radius=args.radius,
                     thickness=args.thickness
                 )
+                
+                # Draw orientation indicators
+                if len(orientations) > 0:
+                    vis_frame = draw_orientation_results(
+                        vis_frame, bboxes[:, 1:5], track_ids,
+                        orientations, binary_orientations,
+                        thickness=args.thickness
+                    )
             else:
                 vis_frame = frame.copy()
         else:
