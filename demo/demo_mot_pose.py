@@ -193,6 +193,78 @@ def draw_pose_results_14kpt(img, keypoints_14_list, track_ids, kpt_thr=0.3, radi
     return img
 
 
+def get_iou(pred_box, gt_box):
+    """
+    Calculate Intersection over Union (IOU) between two bounding boxes.
+    
+    Args:
+        pred_box: predicted bounding box [x1, y1, x2, y2]
+        gt_box: ground truth bounding box [x1, y1, x2, y2]
+    
+    Returns:
+        float: IOU score between 0 and 1
+    """
+    # Get intersection coordinates
+    ixmin = max(pred_box[0], gt_box[0])
+    ixmax = min(pred_box[2], gt_box[2])
+    iymin = max(pred_box[1], gt_box[1])
+    iymax = min(pred_box[3], gt_box[3])
+
+    iw = np.maximum(ixmax - ixmin + 1., 0.)
+    ih = np.maximum(iymax - iymin + 1., 0.)
+
+    # Calculate intersection area
+    inters = iw * ih
+
+    # Calculate union area
+    uni = ((pred_box[2] - pred_box[0] + 1.) * (pred_box[3] - pred_box[1] + 1.) +
+           (gt_box[2] - gt_box[0] + 1.) * (gt_box[3] - gt_box[1] + 1.) -
+           inters)
+
+    # Calculate IOU
+    iou = inters / uni if uni > 0 else 0
+    return iou
+
+
+def init_target_person(bboxes, track_ids, gt_bbox, iou_threshold=0.4):
+    """
+    Initialize target person by matching ground truth bbox with tracked persons.
+    
+    Args:
+        bboxes: Array of [x1, y1, x2, y2] bounding boxes
+        track_ids: Array of track IDs corresponding to bboxes
+        gt_bbox: Ground truth bounding box [x1, y1, x2, y2]
+        iou_threshold: Minimum IOU threshold to consider a match
+    
+    Returns:
+        tuple: (target_id, target_bbox, max_iou) or (None, None, 0) if no match
+    """
+    if gt_bbox is None or len(bboxes) == 0:
+        return None, None, 0
+    
+    max_iou = iou_threshold
+    target_id = None
+    target_bbox = None
+    
+    print(f"\n[Target Init] GT bbox: {gt_bbox}")
+    for i, (bbox, track_id) in enumerate(zip(bboxes, track_ids)):
+        bbox_coords = bbox[:4]
+        iou = get_iou(bbox_coords, gt_bbox)
+        print(f"  Track {int(track_id)}: bbox={bbox_coords.astype(int)}, IOU={iou:.3f}")
+        
+        if iou > max_iou:
+            max_iou = iou
+            target_id = int(track_id)
+            target_bbox = bbox_coords.astype(int)
+    
+    if target_id is not None:
+        print(f"  -> Target selected: ID={target_id}, IOU={max_iou:.3f}")
+    else:
+        print(f"  -> No target matched (max IOU < {iou_threshold})")
+    
+    return target_id, target_bbox, max_iou
+
+
 def draw_orientation_results(img, bboxes, track_ids, orientations, binary_orientations, 
                               font_scale=0.5, thickness=2, arrow_length=40):
     """
@@ -390,6 +462,12 @@ def main():
     parser.add_argument('--kpt-thr', type=float, default=0.3,
                         help='keypoint score threshold for pose')
     
+    # Target person initialization
+    parser.add_argument('--gt-bbox', type=int, nargs=4, metavar=('X1', 'Y1', 'X2', 'Y2'),
+                        help='ground truth bbox for target person [x1 y1 x2 y2] (only frame 0)')
+    parser.add_argument('--iou-threshold', type=float, default=0.4,
+                        help='IOU threshold for target person matching')
+    
     # Device
     parser.add_argument('--device', default='cpu', help='device (cpu or cuda:0)')
     
@@ -439,6 +517,15 @@ def main():
     
     print(f'Processing {len(video)} frames at {fps} FPS...')
     prog_bar = mmcv.ProgressBar(len(video))
+    
+    # Parse ground truth bbox if provided
+    gt_bbox = None
+    if args.gt_bbox:
+        gt_bbox = np.array(args.gt_bbox, dtype=np.float32)
+    
+    # Target person tracking state
+    target_id = None
+    target_bbox = None
     
     for frame_id, frame in enumerate(video):
         # Step 1: Run tracking
@@ -507,6 +594,15 @@ def main():
                     # for tid, ori, bin_ori in zip(track_ids, orientations, binary_orientations):
                     #     print(f'  Track {tid}: {ori}° ({"Front" if bin_ori == 0 else "Back"})')
                 
+                # Step 3.5: Target person initialization (Frame 0 only)
+                if frame_id == 0 and target_id is None and gt_bbox is not None:
+                    target_id, target_bbox, max_iou = init_target_person(
+                        bboxes[:, 1:5],  # bbox coordinates [x1, y1, x2, y2]
+                        track_ids,
+                        gt_bbox,
+                        iou_threshold=args.iou_threshold
+                    )
+                
                 # Step 4: Visualize results
                 vis_frame = frame.copy()
                 
@@ -531,6 +627,13 @@ def main():
                         orientations, binary_orientations,
                         thickness=args.thickness
                     )
+                
+                # Draw target person bbox if initialized
+                if target_bbox is not None:
+                    x1, y1, x2, y2 = map(int, target_bbox)
+                    cv2.rectangle(vis_frame, (x1, y1), (x2, y2), (0, 255, 0), 3)  # Green box
+                    cv2.putText(vis_frame, f'TARGET (ID:{target_id})', (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             else:
                 vis_frame = frame.copy()
         else:
