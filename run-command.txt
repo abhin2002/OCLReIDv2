@@ -1,0 +1,10 @@
+cd /Users/abhinpt/personal/github/OCLReIDv2 && python demo/demo_mot_pose.py \
+  configs/mot/bytetrack/bytetrack_yolox_x_crowdhuman_mot17-private-half.py \
+  --track-checkpoint checkpoints/bytetrack_yolox_x_mot17.pth \
+  --pose-config configs/pose/hrnet_w48_coco_256x192.py \
+  --pose-checkpoint checkpoints/hrnet_w48_coco_256x192.pth \
+  --input short_clip.mp4 \
+  --output outputs/demo_pose_hoe_v5.mp4 \
+  --device cpu \
+  --gt-bbox 206 93 305 407 \
+  --iou-threshold 0.1

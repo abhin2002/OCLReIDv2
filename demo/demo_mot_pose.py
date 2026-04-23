@@ -13,6 +13,7 @@ from argparse import ArgumentParser
 import cv2
 import mmcv
 import numpy as np
+import torch
 
 from mmtrack.apis import inference_mot, init_model as init_track_model
 from mmpose.apis import (inference_top_down_pose_model, init_pose_model,
@@ -21,6 +22,10 @@ from mmpose.datasets import DatasetInfo
 
 # Import HOE estimator for orientation estimation
 from mmtrack.models.orientation.hoe_estimator import init_hoe_model
+
+# Import OCLREIDIdentifier for person re-identification
+from mmtrack.models.identifier.oclreid_identifier import OCLREIDIdentifier
+from mmtrack.models.identifier.params.hyper_params import HyperParams
 
 
 # COCO dataset info for pose estimation
@@ -428,6 +433,59 @@ def convert_pose_results_to_14keypoints(pose_results):
     return track_kpts
 
 
+def prepare_image_metadata(frame, scale_factor=1.0):
+    """
+    Prepare image metadata for OCLREIDIdentifier.
+    
+    Args:
+        frame: Input image/frame (H, W, 3)
+        scale_factor: Scale factor for the image
+    
+    Returns:
+        List containing metadata dict
+    """
+    h, w, c = frame.shape
+    img_metas = [{
+        'img_shape': (h, w, c),
+        'ori_shape': (h, w, c),
+        'pad_shape': (h, w, c),
+        'scale_factor': scale_factor,
+        'flip': False,
+        'filename': None
+    }]
+    return img_metas
+
+
+def prepare_tracks_for_reid(bboxes, track_ids, keypoints_14_list):
+    """
+    Prepare tracks dict in the format expected by OCLREIDIdentifier.
+    
+    Args:
+        bboxes: Array of [x1, y1, x2, y2, score] from tracking
+        track_ids: Array of track IDs
+        keypoints_14_list: List of (14, 3) keypoint arrays
+    
+    Returns:
+        Dict with format {id: [x1,y1,x2,y2,score,kpts,ori], ...}
+    """
+    tracks = {}
+    for i, (bbox, track_id) in enumerate(zip(bboxes, track_ids)):
+        track_id_int = int(track_id)
+        x1, y1, x2, y2, score = bbox[:5]
+        
+        # Get keypoints for this tracklet
+        kpts = keypoints_14_list[i] if i < len(keypoints_14_list) else np.zeros((14, 3))
+        
+        # For orientation, compute a simple estimate from keypoints if available
+        # Left/right shoulder positions indicate orientation
+        # For now, use 0 as default orientation
+        ori = 0
+        
+        tracks[track_id_int] = [x1, y1, x2, y2, score, kpts, ori]
+    
+    return tracks
+
+
 def main():
     parser = ArgumentParser(description='MMTracking + MMPose Pipeline Demo')
     
@@ -493,6 +551,59 @@ def main():
     if args.enable_hoe:
         print('Loading HOE (orientation estimation) model...')
         hoe_model = init_hoe_model(checkpoint_path=args.hoe_checkpoint, device=args.device)
+    
+    # Initialize OCLREIDIdentifier for person re-identification
+    print('Initializing OCLREIDIdentifier for person re-identification...')
+    
+    # Create ReID parameters
+    reid_params = {
+        'height': 256,  # Image patch height for ReID
+        'width': 192,   # Image patch width for ReID
+        'norm_mean': [0.485, 0.456, 0.406],  # ImageNet normalization mean
+        'norm_std': [0.229, 0.224, 0.225],   # ImageNet normalization std
+        'agent': 'PartOCLWeightedClassifier',  # Classifier type
+        'reid_pos_confidence_thresh': 0.6,
+        'reid_neg_confidence_thresh': 0.30,
+        'reid_positive_count': 5,
+        'initial_training_num_samples': 5,
+        'min_target_confidence': -1,
+        'id_switch_detection_thresh': 0.35,
+    }
+    
+    # Create HyperParams object
+    hyper_params = HyperParams(reid_params)
+    # Add all params to the hyper_params object
+    for key, value in reid_params.items():
+        setattr(hyper_params, key, value)
+    
+    # Initialize the ReID identifier
+    reid_identifier = OCLREIDIdentifier(hyper_params)
+    
+    # Create a minimal RPF model wrapper to provide necessary attributes to the identifier
+    class RPFModelWrapper:
+        def __init__(self, reid_model):
+            self.reid = reid_model
+            self.visdom = None
+            self.debug = False
+            self.save = False
+    
+    # Try to get reid model from tracking model, otherwise use a placeholder
+    reid_model = None
+    try:
+        # Try to extract reid model from tracking model if available
+        if hasattr(track_model, 'module'):
+            if hasattr(track_model.module, 'reid'):
+                reid_model = track_model.module.reid
+        elif hasattr(track_model, 'reid'):
+            reid_model = track_model.reid
+    except:
+        pass
+    
+    # If no reid model found, use pose_model as a feature extractor
+    if reid_model is None:
+        reid_model = pose_model
+    
+    rpf_model = RPFModelWrapper(reid_model)
     
     # Get dataset info for pose
     dataset_info = DatasetInfo(COCO_DATASET_INFO)
@@ -603,7 +714,48 @@ def main():
                         iou_threshold=args.iou_threshold
                     )
                 
-                # Step 4: Visualize results
+                # ============================================================================
+                # STEP 4: TARGET IDENTIFICATION (OCL-ReID)
+                # ============================================================================
+                ident_result = None
+                if target_id is not None:
+                    try:
+                        # Prepare image metadata
+                        img_metas = prepare_image_metadata(frame)
+                        
+                        # Prepare tracks in the format expected by OCLREIDIdentifier
+                        tracks = prepare_tracks_for_reid(bboxes[:, 1:5], track_ids, keypoints_14_list)
+                        
+                        # Initialize the identifier with current target_id if not yet initialized
+                        if reid_identifier.target_id == -1:
+                            reid_identifier.init_identifier(target_id, rpf_model)
+                        
+                        # Convert frame to tensor format if needed
+                        frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(0).float()
+                        if args.device != 'cpu':
+                            frame_tensor = frame_tensor.to(args.device)
+                        
+                        # Run OCLREIDIdentifier
+                        ident_result = reid_identifier.identify(
+                            img=frame_tensor,
+                            img_metas=img_metas,
+                            model=rpf_model,
+                            tracks=tracks,
+                            frame_id=frame_id,
+                            rescale=False,
+                            gt_bbox=gt_bbox if frame_id == 0 else None
+                        )
+                        
+                        if ident_result is not None:
+                            print(f"  [ReID Frame {frame_id}] State: {ident_result.get('state', 'N/A')}, "
+                                  f"Target ID: {ident_result.get('target_id', -1)}, "
+                                  f"Target Conf: {ident_result.get('target_conf', -1):.3f}")
+                    except Exception as e:
+                        print(f"  [ReID Warning] Error during identification: {str(e)}")
+                        ident_result = None
+                
+                # ============================================================================
+                # STEP 5: Visualize results
                 vis_frame = frame.copy()
                 
                 # Draw tracking boxes with IDs (bbox coords are at indices 1-4)
@@ -632,7 +784,17 @@ def main():
                 if target_bbox is not None:
                     x1, y1, x2, y2 = map(int, target_bbox)
                     cv2.rectangle(vis_frame, (x1, y1), (x2, y2), (0, 255, 0), 3)  # Green box
-                    cv2.putText(vis_frame, f'TARGET (ID:{target_id})', (x1, y1 - 10),
+                    
+                    # Prepare target label with confidence from ReID if available
+                    target_label = f'TARGET (ID:{target_id})'
+                    target_conf_text = ''
+                    if ident_result is not None:
+                        target_conf = ident_result.get('target_conf', -1)
+                        state = ident_result.get('state', 'N/A')
+                        if target_conf >= 0:
+                            target_conf_text = f' Conf:{target_conf:.3f} [{state}]'
+                    
+                    cv2.putText(vis_frame, target_label + target_conf_text, (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             else:
                 vis_frame = frame.copy()
