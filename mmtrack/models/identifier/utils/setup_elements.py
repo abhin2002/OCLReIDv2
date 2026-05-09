@@ -1,7 +1,13 @@
 import torch
-from models.resnet import Reduced_ResNet18, SupConResNet
 from torchvision import transforms
 import torch.nn as nn
+
+# Try to import ResNet models, but make them optional
+try:
+    from models.resnet import Reduced_ResNet18, SupConResNet
+except (ImportError, ModuleNotFoundError):
+    Reduced_ResNet18 = None
+    SupConResNet = None
 
 
 default_trick = {'labels_trick': False, 'kd_trick': False, 'separated_softmax': False,

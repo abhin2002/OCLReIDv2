@@ -1,6 +1,6 @@
 # from utils.setup_elements import input_size_match
 from .. import name_match #import update_methods, retrieve_methods
-from utils import maybe_cuda
+from ...utils import maybe_cuda
 import torch
 from .buffer_utils import BufferClassTracker
 # from utils.setup_elements import n_classes

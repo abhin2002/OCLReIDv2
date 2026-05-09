@@ -9,3 +9,11 @@ class HyperParams():
         self.initial_training_num_samples = 5
         self.min_target_confidence = -1
     
+    def __getitem__(self, key):
+        """Make HyperParams subscriptable like a dictionary"""
+        return getattr(self, key, None)
+    
+    def __setitem__(self, key, value):
+        """Allow setting attributes via dictionary-like subscripting"""
+        setattr(self, key, value)
+    

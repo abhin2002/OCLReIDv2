@@ -1,7 +1,7 @@
 from .base import BaseMemory
 import torch
 import numpy as np
-from utils import maybe_cuda
+from ..utils import maybe_cuda
 # import name_match
 from .memory_strategy.buffer import Buffer
 from .memory_strategy.yhj_utils import is_informative_st
