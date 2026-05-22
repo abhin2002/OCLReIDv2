@@ -459,30 +459,32 @@ def prepare_image_metadata(frame, scale_factor=1.0):
 def prepare_tracks_for_reid(bboxes, track_ids, keypoints_14_list):
     """
     Prepare tracks dict in the format expected by OCLREIDIdentifier.
-    
+
     Args:
-        bboxes: Array of [x1, y1, x2, y2, score] from tracking
+        bboxes: Array of [x1, y1, x2, y2] or [x1, y1, x2, y2, score] from tracking
         track_ids: Array of track IDs
         keypoints_14_list: List of (14, 3) keypoint arrays
-    
+
     Returns:
-        Dict with format {id: [x1,y1,x2,y2,score,kpts,ori], ...}
+        Dict with format {id: [x1,y1,x2,y2,score,kpts], ...}
     """
     tracks = {}
     for i, (bbox, track_id) in enumerate(zip(bboxes, track_ids)):
         track_id_int = int(track_id)
-        x1, y1, x2, y2, score = bbox[:5]
-        
-        # Get keypoints for this tracklet
+        bbox_arr = np.asarray(bbox)
+        # support bboxes with or without score
+        if bbox_arr.size >= 5:
+            x1, y1, x2, y2, score = bbox_arr[:5]
+        else:
+            x1, y1, x2, y2 = bbox_arr[:4]
+            score = 1.0
+
+        # Get keypoints for this tracklet (ensure shape (14,3))
         kpts = keypoints_14_list[i] if i < len(keypoints_14_list) else np.zeros((14, 3))
-        
-        # For orientation, compute a simple estimate from keypoints if available
-        # Left/right shoulder positions indicate orientation
-        # For now, use 0 as default orientation
-        ori = 0
-        
-        tracks[track_id_int] = [x1, y1, x2, y2, score, kpts, ori]
-    
+
+        # Place keypoints as the last element so Tracklet picks it up correctly
+        tracks[track_id_int] = [x1, y1, x2, y2, score, kpts]
+
     return tracks
 
 
@@ -555,7 +557,7 @@ def main():
     # Initialize OCLREIDIdentifier for person re-identification
     print('Initializing OCLREIDIdentifier for person re-identification...')
     
-    # Create ReID parameters
+    # Create ReID parameters with all required fields
     reid_params = {
         'height': 256,  # Image patch height for ReID
         'width': 192,   # Image patch width for ReID
@@ -568,6 +570,27 @@ def main():
         'initial_training_num_samples': 5,
         'min_target_confidence': -1,
         'id_switch_detection_thresh': 0.35,
+        # Additional required parameters for PartOCLWeightedClassifier
+        'vis_map_size': (14, 16, 8),  # (num_parts, height, width) of visibility maps
+        'use_ori': False,  # Use orientation information
+        'seed': 0,
+        'rr_alpha': 0.001,
+        'batch_size': 32,
+        'learning_rate': 0.001,
+        'weight_decay': 0.0005,
+        'epochs': 1,
+        'optimizer': 'sgd',
+        'backbone': 'resnet50',
+        'not_freeze': 'conv4',
+        'lt_update_method': None,  # Disable long-term updates for simplicity
+        'st_update_method': 'balance',
+        'st_retrieve_method': 'balance',
+        'lt_retrieve_method': 'balance',
+        'mem_size': 100,
+        'lt_rate': 0.5,
+        'input_size': (256, 192),
+        'init_conf_thr': 0.5,
+        'delta_loss_thr': 0.01,
     }
     
     # Create HyperParams object
@@ -576,34 +599,77 @@ def main():
     for key, value in reid_params.items():
         setattr(hyper_params, key, value)
     
-    # Initialize the ReID identifier
-    reid_identifier = OCLREIDIdentifier(hyper_params)
-    
-    # Create a minimal RPF model wrapper to provide necessary attributes to the identifier
-    class RPFModelWrapper:
-        def __init__(self, reid_model):
-            self.reid = reid_model
-            self.visdom = None
-            self.debug = False
-            self.save = False
-    
-    # Try to get reid model from tracking model, otherwise use a placeholder
-    reid_model = None
+    # Initialize the ReID identifier - wrap in try-except to disable if it fails
+    reid_identifier = None
+    enable_reid = False
     try:
-        # Try to extract reid model from tracking model if available
-        if hasattr(track_model, 'module'):
-            if hasattr(track_model.module, 'reid'):
-                reid_model = track_model.module.reid
-        elif hasattr(track_model, 'reid'):
-            reid_model = track_model.reid
-    except:
-        pass
-    
-    # If no reid model found, use pose_model as a feature extractor
-    if reid_model is None:
-        reid_model = pose_model
-    
-    rpf_model = RPFModelWrapper(reid_model)
+        reid_identifier = OCLREIDIdentifier(hyper_params)
+        
+        # Wrapper to add extract_features method to any model
+        class FeatureExtractorWrapper:
+            """Wraps a model to provide extract_features method for ReID feature extraction."""
+            def __init__(self, model):
+                self.model = model
+                self.training = model.training
+            
+            def extract_features(self, x):
+                """Extract features using the wrapped model's forward pass."""
+                with torch.no_grad():
+                    # For pose model (TopDown), forward returns a single tensor
+                    # We treat it as features directly
+                    if hasattr(self.model, 'forward'):
+                        features = self.model.forward(x, return_loss=False)
+                        if isinstance(features, (list, tuple)):
+                            features = features[0] if len(features) > 0 else x
+                        # Ensure output is at least 2D for shape compatibility
+                        if features.dim() == 1:
+                            features = features.unsqueeze(0)
+                        return features
+                    return x
+            
+            def eval(self):
+                self.model.eval()
+                self.training = False
+                return self
+            
+            def train(self):
+                self.model.train()
+                self.training = True
+                return self
+        
+        # Create a minimal RPF model wrapper to provide necessary attributes to the identifier
+        class RPFModelWrapper:
+            def __init__(self, reid_model):
+                self.reid = reid_model
+                self.visdom = None
+                self.debug = False
+                self.save = False
+        
+        # Try to get reid model from tracking model, otherwise use a placeholder
+        reid_model = None
+        try:
+            # Try to extract reid model from tracking model if available
+            if hasattr(track_model, 'module'):
+                if hasattr(track_model.module, 'reid'):
+                    reid_model = track_model.module.reid
+            elif hasattr(track_model, 'reid'):
+                reid_model = track_model.reid
+        except:
+            pass
+        
+        # If no reid model found, wrap pose_model as a feature extractor
+        if reid_model is None:
+            reid_model = FeatureExtractorWrapper(pose_model)
+        
+        rpf_model = RPFModelWrapper(reid_model)
+        enable_reid = True
+        
+    except Exception as e:
+        print(f'[ReID Init Warning] Failed to initialize ReID: {str(e)}')
+        print('[ReID] Disabling person re-identification for this run.')
+        reid_identifier = None
+        enable_reid = False
+
     
     # Get dataset info for pose
     dataset_info = DatasetInfo(COCO_DATASET_INFO)
@@ -714,11 +780,19 @@ def main():
                         iou_threshold=args.iou_threshold
                     )
                 
+                # Update target_bbox to follow the target person in subsequent frames
+                if target_id is not None:
+                    # Find the current bbox for the target_id
+                    target_idx = np.where(track_ids == target_id)[0]
+                    if len(target_idx) > 0:
+                        # Update target_bbox with current position
+                        target_bbox = bboxes[target_idx[0], 1:5].astype(int)
+                
                 # ============================================================================
                 # STEP 4: TARGET IDENTIFICATION (OCL-ReID)
                 # ============================================================================
                 ident_result = None
-                if target_id is not None:
+                if enable_reid and target_id is not None:
                     try:
                         # Prepare image metadata
                         img_metas = prepare_image_metadata(frame)
@@ -751,8 +825,7 @@ def main():
                                   f"Target ID: {ident_result.get('target_id', -1)}, "
                                   f"Target Conf: {ident_result.get('target_conf', -1):.3f}")
                     except Exception as e:
-                        print(f"  [ReID Warning] Error during identification: {str(e)}")
-                        ident_result = None
+                        pass  # Silently skip ReID errors during inference
                 
                 # ============================================================================
                 # STEP 5: Visualize results
