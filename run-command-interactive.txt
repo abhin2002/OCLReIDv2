@@ -1,0 +1,30 @@
+# Interactive Target Selection Example
+# Run without --gt-bbox to enable interactive selection
+
+cd /Users/abhinpt/personal/github/OCLReIDv2 && python demo/demo_mot_pose.py \
+  configs/mot/bytetrack/bytetrack_yolox_x_crowdhuman_mot17-private-half.py \
+  --track-checkpoint checkpoints/bytetrack_yolox_x_mot17.pth \
+  --pose-config configs/pose/hrnet_w48_coco_256x192.py \
+  --pose-checkpoint checkpoints/hrnet_w48_coco_256x192.pth \
+  --input short_clip.mp4 \
+  --output outputs/demo_pose_interactive.mp4 \
+  --device cpu \
+  --iou-threshold 0.1
+
+# The script will:
+# 1. Load the first frame
+# 2. Display it in a window
+# 3. Allow you to draw a bounding box around the target person
+# 4. Press ENTER to confirm, 'r' to reset, or ESC to cancel
+
+# You can still use the old method with --gt-bbox if needed:
+cd /Users/abhinpt/personal/github/OCLReIDv2 && python demo/demo_mot_pose.py \
+  configs/mot/bytetrack/bytetrack_yolox_x_crowdhuman_mot17-private-half.py \
+  --track-checkpoint checkpoints/bytetrack_yolox_x_mot17.pth \
+  --pose-config configs/pose/hrnet_w48_coco_256x192.py \
+  --pose-checkpoint checkpoints/hrnet_w48_coco_256x192.pth \
+  --input short_clip.mp4 \
+  --output outputs/demo_pose_manual.mp4 \
+  --device cpu \
+  --gt-bbox 206 93 305 407 \
+  --iou-threshold 0.1

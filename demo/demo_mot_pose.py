@@ -82,6 +82,106 @@ COCO_DATASET_INFO = dict(
 )
 
 
+def select_bbox_interactive(frame, window_name='Select Target Person'):
+    """
+    Interactive bounding box selection using mouse drawing.
+    
+    Args:
+        frame: Input frame (BGR image)
+        window_name: Name of the window for display
+    
+    Returns:
+        bbox: [x1, y1, x2, y2] or None if cancelled
+    """
+    bbox = {'drawing': False, 'x1': -1, 'y1': -1, 'x2': -1, 'y2': -1}
+    display_frame = frame.copy()
+    
+    def mouse_callback(event, x, y, flags, param):
+        nonlocal display_frame
+        
+        if event == cv2.EVENT_LBUTTONDOWN:
+            bbox['drawing'] = True
+            bbox['x1'] = x
+            bbox['y1'] = y
+            bbox['x2'] = x
+            bbox['y2'] = y
+        
+        elif event == cv2.EVENT_MOUSEMOVE:
+            if bbox['drawing']:
+                display_frame = frame.copy()
+                bbox['x2'] = x
+                bbox['y2'] = y
+                # Draw rectangle while dragging
+                cv2.rectangle(display_frame, (bbox['x1'], bbox['y1']),
+                            (bbox['x2'], bbox['y2']), (0, 255, 0), 2)
+                cv2.imshow(window_name, display_frame)
+        
+        elif event == cv2.EVENT_LBUTTONUP:
+            bbox['drawing'] = False
+            bbox['x2'] = x
+            bbox['y2'] = y
+            display_frame = frame.copy()
+            # Draw final rectangle
+            cv2.rectangle(display_frame, (bbox['x1'], bbox['y1']),
+                        (bbox['x2'], bbox['y2']), (0, 255, 0), 2)
+            cv2.imshow(window_name, display_frame)
+    
+    # Create window and set mouse callback
+    cv2.namedWindow(window_name)
+    cv2.setMouseCallback(window_name, mouse_callback)
+    
+    # Instructions
+    instructions = [
+        "Draw a bounding box around the target person:",
+        "1. Click and drag to draw a box",
+        "2. Press ENTER to confirm",
+        "3. Press 'r' to reset",
+        "4. Press ESC to cancel"
+    ]
+    
+    # Add instructions to frame
+    instruction_frame = frame.copy()
+    y_offset = 30
+    for i, text in enumerate(instructions):
+        cv2.putText(instruction_frame, text, (10, y_offset + i * 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    
+    cv2.imshow(window_name, instruction_frame)
+    
+    while True:
+        key = cv2.waitKey(1) & 0xFF
+        
+        # Enter key - confirm selection
+        if key == 13:  # Enter
+            if bbox['x1'] >= 0 and bbox['y1'] >= 0 and bbox['x2'] >= 0 and bbox['y2'] >= 0:
+                # Ensure x1 < x2 and y1 < y2
+                x1 = min(bbox['x1'], bbox['x2'])
+                x2 = max(bbox['x1'], bbox['x2'])
+                y1 = min(bbox['y1'], bbox['y2'])
+                y2 = max(bbox['y1'], bbox['y2'])
+                
+                # Validate bbox size
+                if (x2 - x1) > 10 and (y2 - y1) > 10:
+                    cv2.destroyWindow(window_name)
+                    return np.array([x1, y1, x2, y2], dtype=np.float32)
+                else:
+                    print("Bounding box too small. Please draw again.")
+        
+        # 'r' key - reset
+        elif key == ord('r'):
+            bbox = {'drawing': False, 'x1': -1, 'y1': -1, 'x2': -1, 'y2': -1}
+            display_frame = frame.copy()
+            cv2.imshow(window_name, instruction_frame)
+        
+        # ESC key - cancel
+        elif key == 27:  # ESC
+            cv2.destroyWindow(window_name)
+            return None
+    
+    cv2.destroyWindow(window_name)
+    return None
+
+
 def get_track_id_color(track_id):
     """Generate a unique color for each track ID."""
     np.random.seed(track_id)
@@ -524,7 +624,8 @@ def main():
     
     # Target person initialization
     parser.add_argument('--gt-bbox', type=int, nargs=4, metavar=('X1', 'Y1', 'X2', 'Y2'),
-                        help='ground truth bbox for target person [x1 y1 x2 y2] (only frame 0)')
+                        help='ground truth bbox for target person [x1 y1 x2 y2]. '
+                             'If not provided, interactive selection will be used on first frame.')
     parser.add_argument('--iou-threshold', type=float, default=0.4,
                         help='IOU threshold for target person matching')
     
@@ -695,10 +796,27 @@ def main():
     print(f'Processing {len(video)} frames at {fps} FPS...')
     prog_bar = mmcv.ProgressBar(len(video))
     
-    # Parse ground truth bbox if provided
+    # Parse ground truth bbox if provided or use interactive selection
     gt_bbox = None
     if args.gt_bbox:
         gt_bbox = np.array(args.gt_bbox, dtype=np.float32)
+        print(f'Using provided ground truth bbox: {gt_bbox}')
+    else:
+        # Interactive bbox selection on first frame
+        print('\n' + '='*60)
+        print('INTERACTIVE TARGET SELECTION')
+        print('='*60)
+        print('Loading first frame for target selection...')
+        first_frame = video[0]
+        print('Please draw a bounding box around the target person.')
+        gt_bbox = select_bbox_interactive(first_frame)
+        
+        if gt_bbox is None:
+            print('Target selection cancelled. Exiting...')
+            return
+        
+        print(f'Selected bbox: {gt_bbox}')
+        print('='*60 + '\n')
     
     # Target person tracking state
     target_id = None

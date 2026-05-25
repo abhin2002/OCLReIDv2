@@ -122,3 +122,5 @@ mmtrack/.mim
 *.py~
 *.sh~
 outputs/*.mp4
+val
+val/
